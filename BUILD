@@ -8,7 +8,10 @@ filegroup(
 filegroup(
     name = "windows-x86-bundle",
     srcs = glob(
-        include = ["x64/Lib/**"],
+        include = [
+            "x64/Lib/**",
+            "x64/DLLs/**",
+        ],
         exclude = [
             "x64/Lib/test/**",
             "x64/Lib/unittest/**",
