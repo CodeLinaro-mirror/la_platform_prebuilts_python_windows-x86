@@ -2,7 +2,10 @@ package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "windows-x86",
-    srcs = glob(["**"]),
+    srcs = glob(
+        include = ["**"],
+        exclude = [".git/**"]
+    ),
 )
 
 filegroup(
