@@ -16,7 +16,7 @@ filegroup(
             "x64/DLLs/**",
         ],
         exclude = [
-            "x86/**/*.pyc",
+            "**/*.pyc",
             "x64/Lib/test/**",
             "x64/Lib/unittest/**",
             "x64/Lib/config/**",
