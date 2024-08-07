@@ -4,7 +4,10 @@ filegroup(
     name = "windows-x86",
     srcs = glob(
         include = ["**"],
-        exclude = [".git/**"]
+        exclude = [
+            ".git/**",
+            "**/*.pyc",
+        ],
     ),
 )
 
