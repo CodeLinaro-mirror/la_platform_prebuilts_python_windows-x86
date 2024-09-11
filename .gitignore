@@ -2,6 +2,8 @@
 __pycache__/
 *.py[co]
 *$py.class
+*.dll
+*.exe
 
 # Distribution / packaging
 .Python
@@ -21,6 +23,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+Lib/site-packages/
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
