@@ -16,7 +16,7 @@ to modify the meaning of the API call itself.
 import collections
 import collections.abc
 import concurrent.futures
-import errno
+import functools
 import heapq
 import itertools
 import os
@@ -44,7 +44,6 @@ from . import protocols
 from . import sslproto
 from . import staggered
 from . import tasks
-from . import timeouts
 from . import transports
 from . import trsock
 from .log import logger
@@ -278,9 +277,7 @@ class Server(events.AbstractServer):
                  ssl_handshake_timeout, ssl_shutdown_timeout=None):
         self._loop = loop
         self._sockets = sockets
-        # Weak references so we don't break Transport's ability to
-        # detect abandoned transports
-        self._clients = weakref.WeakSet()
+        self._active_count = 0
         self._waiters = []
         self._protocol_factory = protocol_factory
         self._backlog = backlog
@@ -293,13 +290,14 @@ class Server(events.AbstractServer):
     def __repr__(self):
         return f'<{self.__class__.__name__} sockets={self.sockets!r}>'
 
-    def _attach(self, transport):
+    def _attach(self):
         assert self._sockets is not None
-        self._clients.add(transport)
+        self._active_count += 1
 
-    def _detach(self, transport):
-        self._clients.discard(transport)
-        if len(self._clients) == 0 and self._sockets is None:
+    def _detach(self):
+        assert self._active_count > 0
+        self._active_count -= 1
+        if self._active_count == 0 and self._sockets is None:
             self._wakeup()
 
     def _wakeup(self):
@@ -307,7 +305,7 @@ class Server(events.AbstractServer):
         self._waiters = None
         for waiter in waiters:
             if not waiter.done():
-                waiter.set_result(None)
+                waiter.set_result(waiter)
 
     def _start_serving(self):
         if self._serving:
@@ -348,16 +346,8 @@ class Server(events.AbstractServer):
             self._serving_forever_fut.cancel()
             self._serving_forever_fut = None
 
-        if len(self._clients) == 0:
+        if self._active_count == 0:
             self._wakeup()
-
-    def close_clients(self):
-        for transport in self._clients.copy():
-            transport.close()
-
-    def abort_clients(self):
-        for transport in self._clients.copy():
-            transport.abort()
 
     async def start_serving(self):
         self._start_serving()
@@ -387,27 +377,7 @@ class Server(events.AbstractServer):
             self._serving_forever_fut = None
 
     async def wait_closed(self):
-        """Wait until server is closed and all connections are dropped.
-
-        - If the server is not closed, wait.
-        - If it is closed, but there are still active connections, wait.
-
-        Anyone waiting here will be unblocked once both conditions
-        (server is closed and all connections have been dropped)
-        have become true, in either order.
-
-        Historical note: In 3.11 and before, this was broken, returning
-        immediately if the server was already closed, even if there
-        were still active connections. An attempted fix in 3.12.0 was
-        still broken, returning immediately if the server was still
-        open and there were no active connections. Hopefully in 3.12.1
-        we have it right.
-        """
-        # Waiters are unblocked by self._wakeup(), which is called
-        # from two places: self.close() and self._detach(), but only
-        # when both conditions have become true. To signal that this
-        # has happened, self._wakeup() sets self._waiters to None.
-        if self._waiters is None:
+        if self._sockets is None or self._waiters is None:
             return
         waiter = self._loop.create_future()
         self._waiters.append(waiter)
@@ -430,8 +400,6 @@ class BaseEventLoop(events.AbstractEventLoop):
         self._clock_resolution = time.get_clock_info('monotonic').resolution
         self._exception_handler = None
         self.set_debug(coroutines._is_debug_mode())
-        # The preserved state of async generator hooks.
-        self._old_agen_hooks = None
         # In debug mode, if the execution of a callback or a step of a task
         # exceed this duration in seconds, the slow callback/task is logged.
         self.slow_callback_duration = 0.1
@@ -458,30 +426,26 @@ class BaseEventLoop(events.AbstractEventLoop):
         """Create a Future object attached to the loop."""
         return futures.Future(loop=self)
 
-    def create_task(self, coro, *, name=None, context=None, **kwargs):
+    def create_task(self, coro, *, name=None, context=None):
         """Schedule a coroutine object.
 
         Return a task object.
         """
         self._check_closed()
-        if self._task_factory is not None:
-            if context is not None:
-                kwargs["context"] = context
-
-            task = self._task_factory(self, coro, **kwargs)
-            task.set_name(name)
-
-        else:
-            task = tasks.Task(coro, loop=self, name=name, context=context, **kwargs)
+        if self._task_factory is None:
+            task = tasks.Task(coro, loop=self, name=name, context=context)
             if task._source_traceback:
                 del task._source_traceback[-1]
+        else:
+            if context is None:
+                # Use legacy API if context is not needed
+                task = self._task_factory(self, coro)
+            else:
+                task = self._task_factory(self, coro, context=context)
 
-        try:
-            return task
-        finally:
-            # gh-128552: prevent a refcycle of
-            # task.exception().__traceback__->BaseEventLoop.create_task->task
-            del task
+            tasks._set_task_name(task, name)
+
+        return task
 
     def set_task_factory(self, factory):
         """Set a task factory that will be used by loop.create_task().
@@ -489,10 +453,9 @@ class BaseEventLoop(events.AbstractEventLoop):
         If factory is None the default task factory will be set.
 
         If factory is a callable, it should have a signature matching
-        '(loop, coro, **kwargs)', where 'loop' will be a reference to the active
-        event loop, 'coro' will be a coroutine object, and **kwargs will be
-        arbitrary keyword arguments that should be passed on to Task.
-        The callable must return a Task.
+        '(loop, coro)', where 'loop' will be a reference to the active
+        event loop, 'coro' will be a coroutine object.  The callable
+        must return a Future.
         """
         if factory is not None and not callable(factory):
             raise TypeError('task factory must be a callable or None')
@@ -598,13 +561,8 @@ class BaseEventLoop(events.AbstractEventLoop):
                     'asyncgen': agen
                 })
 
-    async def shutdown_default_executor(self, timeout=None):
-        """Schedule the shutdown of the default executor.
-
-        The timeout parameter specifies the amount of time the executor will
-        be given to finish joining. The default value is None, which means
-        that the executor will be given an unlimited amount of time.
-        """
+    async def shutdown_default_executor(self):
+        """Schedule the shutdown of the default executor."""
         self._executor_shutdown_called = True
         if self._default_executor is None:
             return
@@ -612,24 +570,17 @@ class BaseEventLoop(events.AbstractEventLoop):
         thread = threading.Thread(target=self._do_shutdown, args=(future,))
         thread.start()
         try:
-            async with timeouts.timeout(timeout):
-                await future
-        except TimeoutError:
-            warnings.warn("The executor did not finishing joining "
-                          f"its threads within {timeout} seconds.",
-                          RuntimeWarning, stacklevel=2)
-            self._default_executor.shutdown(wait=False)
-        else:
+            await future
+        finally:
             thread.join()
 
     def _do_shutdown(self, future):
         try:
             self._default_executor.shutdown(wait=True)
             if not self.is_closed():
-                self.call_soon_threadsafe(futures._set_result_unless_cancelled,
-                                          future, None)
+                self.call_soon_threadsafe(future.set_result, None)
         except Exception as ex:
-            if not self.is_closed() and not future.cancelled():
+            if not self.is_closed():
                 self.call_soon_threadsafe(future.set_exception, ex)
 
     def _check_running(self):
@@ -639,52 +590,29 @@ class BaseEventLoop(events.AbstractEventLoop):
             raise RuntimeError(
                 'Cannot run the event loop while another loop is running')
 
-    def _run_forever_setup(self):
-        """Prepare the run loop to process events.
-
-        This method exists so that custom event loop subclasses (e.g., event loops
-        that integrate a GUI event loop with Python's event loop) have access to all the
-        loop setup logic.
-        """
+    def run_forever(self):
+        """Run until stop() is called."""
         self._check_closed()
         self._check_running()
         self._set_coroutine_origin_tracking(self._debug)
 
-        self._old_agen_hooks = sys.get_asyncgen_hooks()
-        self._thread_id = threading.get_ident()
-        sys.set_asyncgen_hooks(
-            firstiter=self._asyncgen_firstiter_hook,
-            finalizer=self._asyncgen_finalizer_hook
-        )
-
-        events._set_running_loop(self)
-
-    def _run_forever_cleanup(self):
-        """Clean up after an event loop finishes the looping over events.
-
-        This method exists so that custom event loop subclasses (e.g., event loops
-        that integrate a GUI event loop with Python's event loop) have access to all the
-        loop cleanup logic.
-        """
-        self._stopping = False
-        self._thread_id = None
-        events._set_running_loop(None)
-        self._set_coroutine_origin_tracking(False)
-        # Restore any pre-existing async generator hooks.
-        if self._old_agen_hooks is not None:
-            sys.set_asyncgen_hooks(*self._old_agen_hooks)
-            self._old_agen_hooks = None
-
-    def run_forever(self):
-        """Run until stop() is called."""
-        self._run_forever_setup()
+        old_agen_hooks = sys.get_asyncgen_hooks()
         try:
+            self._thread_id = threading.get_ident()
+            sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook,
+                                   finalizer=self._asyncgen_finalizer_hook)
+
+            events._set_running_loop(self)
             while True:
                 self._run_once()
                 if self._stopping:
                     break
         finally:
-            self._run_forever_cleanup()
+            self._stopping = False
+            self._thread_id = None
+            events._set_running_loop(None)
+            self._set_coroutine_origin_tracking(False)
+            sys.set_asyncgen_hooks(*old_agen_hooks)
 
     def run_until_complete(self, future):
         """Run until the Future is done.
@@ -788,7 +716,7 @@ class BaseEventLoop(events.AbstractEventLoop):
         always relative to the current time.
 
         Each callback will be called exactly once.  If two callbacks
-        are scheduled for exactly the same time, it is undefined which
+        are scheduled for exactly the same time, it undefined which
         will be called first.
 
         Any positional arguments after the callback will be passed to
@@ -1019,43 +947,39 @@ class BaseEventLoop(events.AbstractEventLoop):
         family, type_, proto, _, address = addr_info
         sock = None
         try:
-            try:
-                sock = socket.socket(family=family, type=type_, proto=proto)
-                sock.setblocking(False)
-                if local_addr_infos is not None:
-                    for lfamily, _, _, _, laddr in local_addr_infos:
-                        # skip local addresses of different family
-                        if lfamily != family:
-                            continue
-                        try:
-                            sock.bind(laddr)
-                            break
-                        except OSError as exc:
-                            msg = (
-                                f'error while attempting to bind on '
-                                f'address {laddr!r}: {str(exc).lower()}'
-                            )
-                            exc = OSError(exc.errno, msg)
-                            my_exceptions.append(exc)
-                    else:  # all bind attempts failed
-                        if my_exceptions:
-                            raise my_exceptions.pop()
-                        else:
-                            raise OSError(f"no matching local address with {family=} found")
-                await self.sock_connect(sock, address)
-                return sock
-            except OSError as exc:
-                my_exceptions.append(exc)
-                raise
+            sock = socket.socket(family=family, type=type_, proto=proto)
+            sock.setblocking(False)
+            if local_addr_infos is not None:
+                for lfamily, _, _, _, laddr in local_addr_infos:
+                    # skip local addresses of different family
+                    if lfamily != family:
+                        continue
+                    try:
+                        sock.bind(laddr)
+                        break
+                    except OSError as exc:
+                        msg = (
+                            f'error while attempting to bind on '
+                            f'address {laddr!r}: '
+                            f'{exc.strerror.lower()}'
+                        )
+                        exc = OSError(exc.errno, msg)
+                        my_exceptions.append(exc)
+                else:  # all bind attempts failed
+                    if my_exceptions:
+                        raise my_exceptions.pop()
+                    else:
+                        raise OSError(f"no matching local address with {family=} found")
+            await self.sock_connect(sock, address)
+            return sock
+        except OSError as exc:
+            my_exceptions.append(exc)
+            if sock is not None:
+                sock.close()
+            raise
         except:
             if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    # An error when closing a newly created socket is
-                    # not important, but it can overwrite more important
-                    # non-OSError error. So ignore it.
-                    pass
+                sock.close()
             raise
         finally:
             exceptions = my_exceptions = None
@@ -1067,8 +991,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             local_addr=None, server_hostname=None,
             ssl_handshake_timeout=None,
             ssl_shutdown_timeout=None,
-            happy_eyeballs_delay=None, interleave=None,
-            all_errors=False):
+            happy_eyeballs_delay=None, interleave=None):
         """Connect to a TCP server.
 
         Create a streaming transport connection to a given internet host and
@@ -1149,27 +1072,18 @@ class BaseEventLoop(events.AbstractEventLoop):
                     except OSError:
                         continue
             else:  # using happy eyeballs
-                sock = (await staggered.staggered_race(
-                    (
-                        # can't use functools.partial as it keeps a reference
-                        # to exceptions
-                        lambda addrinfo=addrinfo: self._connect_sock(
-                            exceptions, addrinfo, laddr_infos
-                        )
-                        for addrinfo in infos
-                    ),
-                    happy_eyeballs_delay,
-                    loop=self,
-                ))[0]  # can't use sock, _, _ as it keeks a reference to exceptions
+                sock, _, _ = await staggered.staggered_race(
+                    (functools.partial(self._connect_sock,
+                                       exceptions, addrinfo, laddr_infos)
+                     for addrinfo in infos),
+                    happy_eyeballs_delay, loop=self)
 
             if sock is None:
                 exceptions = [exc for sub in exceptions for exc in sub]
                 try:
-                    if all_errors:
-                        raise ExceptionGroup("create_connection failed", exceptions)
                     if len(exceptions) == 1:
                         raise exceptions[0]
-                    elif exceptions:
+                    else:
                         # If they all have the same str(), raise one.
                         model = str(exceptions[0])
                         if all(str(exc) == model for exc in exceptions):
@@ -1178,9 +1092,6 @@ class BaseEventLoop(events.AbstractEventLoop):
                         # the various error messages.
                         raise OSError('Multiple exceptions: {}'.format(
                             ', '.join(str(exc) for exc in exceptions)))
-                    else:
-                        # No exceptions were collected, raise a timeout error
-                        raise TimeoutError('create_connection failed')
                 finally:
                     exceptions = None
 
@@ -1306,8 +1217,8 @@ class BaseEventLoop(events.AbstractEventLoop):
                 read = await self.run_in_executor(None, file.readinto, view)
                 if not read:
                     return total_sent  # EOF
-                transp.write(view[:read])
                 await proto.drain()
+                transp.write(view[:read])
                 total_sent += read
         finally:
             if total_sent > 0 and hasattr(file, 'seek'):
@@ -1369,9 +1280,9 @@ class BaseEventLoop(events.AbstractEventLoop):
                                        allow_broadcast=None, sock=None):
         """Create datagram connection."""
         if sock is not None:
-            if sock.type == socket.SOCK_STREAM:
+            if sock.type != socket.SOCK_DGRAM:
                 raise ValueError(
-                    f'A datagram socket was expected, got {sock!r}')
+                    f'A UDP Socket was expected, got {sock!r}')
             if (local_addr or remote_addr or
                     family or proto or flags or
                     reuse_port or allow_broadcast):
@@ -1526,7 +1437,6 @@ class BaseEventLoop(events.AbstractEventLoop):
             ssl=None,
             reuse_address=None,
             reuse_port=None,
-            keep_alive=None,
             ssl_handshake_timeout=None,
             ssl_shutdown_timeout=None,
             start_serving=True):
@@ -1598,13 +1508,8 @@ class BaseEventLoop(events.AbstractEventLoop):
                     if reuse_address:
                         sock.setsockopt(
                             socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-                    # Since Linux 6.12.9, SO_REUSEPORT is not allowed
-                    # on other address families than AF_INET/AF_INET6.
-                    if reuse_port and af in (socket.AF_INET, socket.AF_INET6):
+                    if reuse_port:
                         _set_reuseport(sock)
-                    if keep_alive:
-                        sock.setsockopt(
-                            socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)
                     # Disable IPv4/IPv6 dual stack support (enabled by
                     # default on Linux) which makes a single socket
                     # listen on both address families.
@@ -1617,22 +1522,9 @@ class BaseEventLoop(events.AbstractEventLoop):
                     try:
                         sock.bind(sa)
                     except OSError as err:
-                        msg = ('error while attempting '
-                               'to bind on address %r: %s'
-                               % (sa, str(err).lower()))
-                        if err.errno == errno.EADDRNOTAVAIL:
-                            # Assume the family is not enabled (bpo-30945)
-                            sockets.pop()
-                            sock.close()
-                            if self._debug:
-                                logger.warning(msg)
-                            continue
-                        raise OSError(err.errno, msg) from None
-
-                if not sockets:
-                    raise OSError('could not bind on any address out of %r'
-                                  % ([info[4] for info in infos],))
-
+                        raise OSError(err.errno, 'error while attempting '
+                                      'to bind on address %r: %s'
+                                      % (sa, err.strerror.lower())) from None
                 completed = True
             finally:
                 if not completed:
@@ -1891,8 +1783,6 @@ class BaseEventLoop(events.AbstractEventLoop):
         - 'protocol' (optional): Protocol instance;
         - 'transport' (optional): Transport instance;
         - 'socket' (optional): Socket instance;
-        - 'source_traceback' (optional): Traceback of the source;
-        - 'handle_traceback' (optional): Traceback of the handle;
         - 'asyncgen' (optional): Asynchronous generator that caused
                                  the exception.
 
@@ -1915,22 +1805,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                              exc_info=True)
         else:
             try:
-                ctx = None
-                thing = context.get("task")
-                if thing is None:
-                    # Even though Futures don't have a context,
-                    # Task is a subclass of Future,
-                    # and sometimes the 'future' key holds a Task.
-                    thing = context.get("future")
-                if thing is None:
-                    # Handles also have a context.
-                    thing = context.get("handle")
-                if thing is not None and hasattr(thing, "get_context"):
-                    ctx = thing.get_context()
-                if ctx is not None and hasattr(ctx, "run"):
-                    ctx.run(self._exception_handler, self, context)
-                else:
-                    self._exception_handler(self, context)
+                self._exception_handler(self, context)
             except (SystemExit, KeyboardInterrupt):
                 raise
             except BaseException as exc:
@@ -2003,11 +1878,8 @@ class BaseEventLoop(events.AbstractEventLoop):
             timeout = 0
         elif self._scheduled:
             # Compute the desired timeout.
-            timeout = self._scheduled[0]._when - self.time()
-            if timeout > MAXIMUM_SELECT_TIMEOUT:
-                timeout = MAXIMUM_SELECT_TIMEOUT
-            elif timeout < 0:
-                timeout = 0
+            when = self._scheduled[0]._when
+            timeout = min(max(0, when - self.time()), MAXIMUM_SELECT_TIMEOUT)
 
         event_list = self._selector.select(timeout)
         self._process_events(event_list)

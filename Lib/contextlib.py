@@ -20,8 +20,6 @@ class AbstractContextManager(abc.ABC):
 
     __class_getitem__ = classmethod(GenericAlias)
 
-    __slots__ = ()
-
     def __enter__(self):
         """Return `self` upon entering the runtime context."""
         return self
@@ -43,8 +41,6 @@ class AbstractAsyncContextManager(abc.ABC):
     """An abstract base class for asynchronous context managers."""
 
     __class_getitem__ = classmethod(GenericAlias)
-
-    __slots__ = ()
 
     async def __aenter__(self):
         """Return `self` upon entering the runtime context."""
@@ -149,17 +145,14 @@ class _GeneratorContextManager(
             except StopIteration:
                 return False
             else:
-                try:
-                    raise RuntimeError("generator didn't stop")
-                finally:
-                    self.gen.close()
+                raise RuntimeError("generator didn't stop")
         else:
             if value is None:
                 # Need to force instantiation so we can reliably
                 # tell if we get the same exception back
                 value = typ()
             try:
-                self.gen.throw(value)
+                self.gen.throw(typ, value, traceback)
             except StopIteration as exc:
                 # Suppress StopIteration *unless* it's the same exception that
                 # was passed to throw().  This prevents a StopIteration
@@ -194,10 +187,7 @@ class _GeneratorContextManager(
                     raise
                 exc.__traceback__ = traceback
                 return False
-            try:
-                raise RuntimeError("generator didn't stop after throw()")
-            finally:
-                self.gen.close()
+            raise RuntimeError("generator didn't stop after throw()")
 
 class _AsyncGeneratorContextManager(
     _GeneratorContextManagerBase,
@@ -222,17 +212,14 @@ class _AsyncGeneratorContextManager(
             except StopAsyncIteration:
                 return False
             else:
-                try:
-                    raise RuntimeError("generator didn't stop")
-                finally:
-                    await self.gen.aclose()
+                raise RuntimeError("generator didn't stop")
         else:
             if value is None:
                 # Need to force instantiation so we can reliably
                 # tell if we get the same exception back
                 value = typ()
             try:
-                await self.gen.athrow(value)
+                await self.gen.athrow(typ, value, traceback)
             except StopAsyncIteration as exc:
                 # Suppress StopIteration *unless* it's the same exception that
                 # was passed to throw().  This prevents a StopIteration
@@ -267,10 +254,7 @@ class _AsyncGeneratorContextManager(
                     raise
                 exc.__traceback__ = traceback
                 return False
-            try:
-                raise RuntimeError("generator didn't stop after athrow()")
-            finally:
-                await self.gen.aclose()
+            raise RuntimeError("generator didn't stop after athrow()")
 
 
 def contextmanager(func):
@@ -457,16 +441,7 @@ class suppress(AbstractContextManager):
         # exactly reproduce the limitations of the CPython interpreter.
         #
         # See http://bugs.python.org/issue12029 for more details
-        if exctype is None:
-            return
-        if issubclass(exctype, self._exceptions):
-            return True
-        if issubclass(exctype, BaseExceptionGroup):
-            match, rest = excinst.split(self._exceptions)
-            if rest is None:
-                return True
-            raise rest
-        return False
+        return exctype is not None and issubclass(exctype, self._exceptions)
 
 
 class _BaseExitStack:
@@ -569,12 +544,11 @@ class ExitStack(_BaseExitStack, AbstractContextManager):
         return self
 
     def __exit__(self, *exc_details):
-        exc = exc_details[1]
-        received_exc = exc is not None
+        received_exc = exc_details[0] is not None
 
         # We manipulate the exception state so it behaves as though
         # we were actually nesting multiple with statements
-        frame_exc = sys.exception()
+        frame_exc = sys.exc_info()[1]
         def _fix_exception_context(new_exc, old_exc):
             # Context may not be correct, so find the end of the chain
             while 1:
@@ -597,28 +571,24 @@ class ExitStack(_BaseExitStack, AbstractContextManager):
             is_sync, cb = self._exit_callbacks.pop()
             assert is_sync
             try:
-                if exc is None:
-                    exc_details = None, None, None
-                else:
-                    exc_details = type(exc), exc, exc.__traceback__
                 if cb(*exc_details):
                     suppressed_exc = True
                     pending_raise = False
-                    exc = None
-            except BaseException as new_exc:
+                    exc_details = (None, None, None)
+            except:
+                new_exc_details = sys.exc_info()
                 # simulate the stack of exceptions by setting the context
-                _fix_exception_context(new_exc, exc)
+                _fix_exception_context(new_exc_details[1], exc_details[1])
                 pending_raise = True
-                exc = new_exc
-
+                exc_details = new_exc_details
         if pending_raise:
             try:
-                # bare "raise exc" replaces our carefully
+                # bare "raise exc_details[1]" replaces our carefully
                 # set-up context
-                fixed_ctx = exc.__context__
-                raise exc
+                fixed_ctx = exc_details[1].__context__
+                raise exc_details[1]
             except BaseException:
-                exc.__context__ = fixed_ctx
+                exc_details[1].__context__ = fixed_ctx
                 raise
         return received_exc and suppressed_exc
 
@@ -714,12 +684,11 @@ class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
         return self
 
     async def __aexit__(self, *exc_details):
-        exc = exc_details[1]
-        received_exc = exc is not None
+        received_exc = exc_details[0] is not None
 
         # We manipulate the exception state so it behaves as though
         # we were actually nesting multiple with statements
-        frame_exc = sys.exception()
+        frame_exc = sys.exc_info()[1]
         def _fix_exception_context(new_exc, old_exc):
             # Context may not be correct, so find the end of the chain
             while 1:
@@ -741,10 +710,6 @@ class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
         while self._exit_callbacks:
             is_sync, cb = self._exit_callbacks.pop()
             try:
-                if exc is None:
-                    exc_details = None, None, None
-                else:
-                    exc_details = type(exc), exc, exc.__traceback__
                 if is_sync:
                     cb_suppress = cb(*exc_details)
                 else:
@@ -753,21 +718,21 @@ class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
                 if cb_suppress:
                     suppressed_exc = True
                     pending_raise = False
-                    exc = None
-            except BaseException as new_exc:
+                    exc_details = (None, None, None)
+            except:
+                new_exc_details = sys.exc_info()
                 # simulate the stack of exceptions by setting the context
-                _fix_exception_context(new_exc, exc)
+                _fix_exception_context(new_exc_details[1], exc_details[1])
                 pending_raise = True
-                exc = new_exc
-
+                exc_details = new_exc_details
         if pending_raise:
             try:
-                # bare "raise exc" replaces our carefully
+                # bare "raise exc_details[1]" replaces our carefully
                 # set-up context
-                fixed_ctx = exc.__context__
-                raise exc
+                fixed_ctx = exc_details[1].__context__
+                raise exc_details[1]
             except BaseException:
-                exc.__context__ = fixed_ctx
+                exc_details[1].__context__ = fixed_ctx
                 raise
         return received_exc and suppressed_exc
 

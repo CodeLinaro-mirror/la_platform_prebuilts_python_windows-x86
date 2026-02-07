@@ -99,7 +99,6 @@ import io
 import collections
 import collections.abc
 import contextlib
-import weakref
 
 from . import ElementPath
 
@@ -189,6 +188,19 @@ class Element:
         """
         return self.__class__(tag, attrib)
 
+    def copy(self):
+        """Return copy of current element.
+
+        This creates a shallow copy. Subelements will be shared with the
+        original tree.
+
+        """
+        warnings.warn(
+            "elem.copy() is deprecated. Use copy.copy(elem) instead.",
+            DeprecationWarning
+            )
+        return self.__copy__()
+
     def __copy__(self):
         elem = self.makeelement(self.tag, self.attrib)
         elem.text = self.text
@@ -201,10 +213,9 @@ class Element:
 
     def __bool__(self):
         warnings.warn(
-            "Testing an element's truth value will always return True in "
-            "future versions.  "
+            "The behavior of this method will change in future versions.  "
             "Use specific 'len(elem)' or 'elem is not None' test instead.",
-            DeprecationWarning, stacklevel=2
+            FutureWarning, stacklevel=2
             )
         return len(self._children) != 0 # emulate old behaviour, for now
 
@@ -523,9 +534,7 @@ class ElementTree:
 
     """
     def __init__(self, element=None, file=None):
-        if element is not None and not iselement(element):
-            raise TypeError('expected an Element, not %s' %
-                            type(element).__name__)
+        # assert element is None or iselement(element)
         self._root = element # first node
         if file:
             self.parse(file)
@@ -541,9 +550,7 @@ class ElementTree:
         with the given element.  Use with care!
 
         """
-        if not iselement(element):
-            raise TypeError('expected an Element, not %s'
-                            % type(element).__name__)
+        # assert iselement(element)
         self._root = element
 
     def parse(self, source, parser=None):
@@ -572,7 +579,10 @@ class ElementTree:
                     # it with chunks.
                     self._root = parser._parse_whole(source)
                     return self._root
-            while data := source.read(65536):
+            while True:
+                data = source.read(65536)
+                if not data:
+                    break
                 parser.feed(data)
             self._root = parser.close()
             return self._root
@@ -709,8 +719,6 @@ class ElementTree:
                                     of start/end tags
 
         """
-        if self._root is None:
-            raise TypeError('ElementTree not initialized')
         if not method:
             method = "xml"
         elif method not in _serialize:
@@ -1230,14 +1238,13 @@ def iterparse(source, events=None, parser=None):
     # parser argument of iterparse is removed, this can be killed.
     pullparser = XMLPullParser(events=events, _parser=parser)
 
-    if not hasattr(source, "read"):
-        source = open(source, "rb")
-        close_source = True
-    else:
-        close_source = False
-
     def iterator(source):
+        close_source = False
         try:
+            if not hasattr(source, "read"):
+                source = open(source, "rb")
+                close_source = True
+            yield None
             while True:
                 yield from pullparser.read_events()
                 # load event buffer
@@ -1247,30 +1254,18 @@ def iterparse(source, events=None, parser=None):
                 pullparser.feed(data)
             root = pullparser._close_and_return_root()
             yield from pullparser.read_events()
-            it = wr()
-            if it is not None:
-                it.root = root
+            it.root = root
         finally:
             if close_source:
                 source.close()
 
-    gen = iterator(source)
     class IterParseIterator(collections.abc.Iterator):
-        __next__ = gen.__next__
-        def close(self):
-            if close_source:
-                source.close()
-            gen.close()
-
-        def __del__(self):
-            # TODO: Emit a ResourceWarning if it was not explicitly closed.
-            # (When the close() method will be supported in all maintained Python versions.)
-            if close_source:
-                source.close()
-
+        __next__ = iterator(source).__next__
     it = IterParseIterator()
     it.root = None
-    wr = weakref.ref(it)
+    del iterator, IterParseIterator
+
+    next(it)
     return it
 
 
@@ -1325,11 +1320,6 @@ class XMLPullParser:
                 raise event
             else:
                 yield event
-
-    def flush(self):
-        if self._parser is None:
-            raise ValueError("flush() called after end of stream")
-        self._parser.flush()
 
 
 def XML(text, parser=None):
@@ -1737,15 +1727,6 @@ class XMLParser:
             del self.parser, self._parser
             del self.target, self._target
 
-    def flush(self):
-        was_enabled = self.parser.GetReparseDeferralEnabled()
-        try:
-            self.parser.SetReparseDeferralEnabled(False)
-            self.parser.Parse(b"", False)
-        except self._error as v:
-            self._raiseerror(v)
-        finally:
-            self.parser.SetReparseDeferralEnabled(was_enabled)
 
 # --------------------------------------------------------------------
 # C14N 2.0

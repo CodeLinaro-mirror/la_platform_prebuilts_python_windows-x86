@@ -2,18 +2,18 @@
 
 Note: BaseHTTPRequestHandler doesn't implement any HTTP request; see
 SimpleHTTPRequestHandler for simple implementations of GET, HEAD and POST,
-and (deprecated) CGIHTTPRequestHandler for CGI scripts.
+and CGIHTTPRequestHandler for CGI scripts.
 
-It does, however, optionally implement HTTP/1.1 persistent connections.
+It does, however, optionally implement HTTP/1.1 persistent connections,
+as of version 0.3.
 
 Notes on CGIHTTPRequestHandler
 ------------------------------
 
-This class is deprecated. It implements GET and POST requests to cgi-bin scripts.
+This class implements GET and POST requests to cgi-bin scripts.
 
-If the os.fork() function is not present (Windows), subprocess.Popen() is used,
-with slightly altered but never documented semantics.  Use from a threaded
-process is likely to trigger a warning at os.fork() time.
+If the os.fork() function is not present (e.g. on Windows),
+subprocess.Popen() is used as a fallback, with slightly altered semantics.
 
 In all cases, the implementation is intentionally naive -- all
 requests are executed synchronously.
@@ -126,10 +126,6 @@ DEFAULT_ERROR_MESSAGE = """\
 """
 
 DEFAULT_ERROR_CONTENT_TYPE = "text/html;charset=utf-8"
-
-# Data larger than this will be read in chunks, to prevent extreme
-# overallocation.
-_MIN_READ_BUF_SIZE = 1 << 20
 
 class HTTPServer(socketserver.TCPServer):
 
@@ -279,7 +275,6 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
         error response has already been sent back.
 
         """
-        is_http_0_9 = False
         self.command = None  # set in case of error on the first line
         self.request_version = version = self.default_request_version
         self.close_connection = True
@@ -337,7 +332,6 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
                     HTTPStatus.BAD_REQUEST,
                     "Bad HTTP/0.9 request type (%r)" % command)
                 return False
-            is_http_0_9 = True
         self.command, self.path = command, path
 
         # gh-87389: The purpose of replacing '//' with '/' is to protect
@@ -346,11 +340,6 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
         # without scheme (similar to http://path) rather than a path.
         if self.path.startswith('//'):
             self.path = '/' + self.path.lstrip('/')  # Reduce to a single /
-
-        # For HTTP/0.9, headers are not expected at all.
-        if is_http_0_9:
-            self.headers = {}
-            return True
 
         # Examine the headers and look for a Connection directive.
         try:
@@ -668,7 +657,6 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     """
 
     server_version = "SimpleHTTP/" + __version__
-    index_pages = ("index.html", "index.htm")
     extensions_map = _encodings_map_default = {
         '.gz': 'application/gzip',
         '.Z': 'application/octet-stream',
@@ -712,7 +700,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         f = None
         if os.path.isdir(path):
             parts = urllib.parse.urlsplit(self.path)
-            if not parts.path.endswith(('/', '%2f', '%2F')):
+            if not parts.path.endswith('/'):
                 # redirect browser - doing basically what apache does
                 self.send_response(HTTPStatus.MOVED_PERMANENTLY)
                 new_parts = (parts[0], parts[1], parts[2] + '/',
@@ -722,7 +710,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return None
-            for index in self.index_pages:
+            for index in "index.html", "index.htm":
                 index = os.path.join(path, index)
                 if os.path.isfile(index):
                     path = index
@@ -802,14 +790,11 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             return None
         list.sort(key=lambda a: a.lower())
         r = []
-        displaypath = self.path
-        displaypath = displaypath.split('#', 1)[0]
-        displaypath = displaypath.split('?', 1)[0]
         try:
-            displaypath = urllib.parse.unquote(displaypath,
+            displaypath = urllib.parse.unquote(self.path,
                                                errors='surrogatepass')
         except UnicodeDecodeError:
-            displaypath = urllib.parse.unquote(displaypath)
+            displaypath = urllib.parse.unquote(self.path)
         displaypath = html.escape(displaypath, quote=False)
         enc = sys.getfilesystemencoding()
         title = f'Directory listing for {displaypath}'
@@ -854,14 +839,14 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
         """
         # abandon query parameters
-        path = path.split('#', 1)[0]
-        path = path.split('?', 1)[0]
+        path = path.split('?',1)[0]
+        path = path.split('#',1)[0]
         # Don't forget explicit trailing slash when normalizing. Issue17324
+        trailing_slash = path.rstrip().endswith('/')
         try:
             path = urllib.parse.unquote(path, errors='surrogatepass')
         except UnicodeDecodeError:
             path = urllib.parse.unquote(path)
-        trailing_slash = path.endswith('/')
         path = posixpath.normpath(path)
         words = path.split('/')
         words = filter(None, words)
@@ -911,7 +896,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         ext = ext.lower()
         if ext in self.extensions_map:
             return self.extensions_map[ext]
-        guess, _ = mimetypes.guess_file_type(path)
+        guess, _ = mimetypes.guess_type(path)
         if guess:
             return guess
         return 'application/octet-stream'
@@ -999,12 +984,6 @@ class CGIHTTPRequestHandler(SimpleHTTPRequestHandler):
     The POST command is *only* implemented for CGI scripts.
 
     """
-
-    def __init__(self, *args, **kwargs):
-        import warnings
-        warnings._deprecated("http.server.CGIHTTPRequestHandler",
-                             remove=(3, 15))
-        super().__init__(*args, **kwargs)
 
     # Determine platform specifics
     have_fork = hasattr(os, 'fork')
@@ -1118,7 +1097,7 @@ class CGIHTTPRequestHandler(SimpleHTTPRequestHandler):
                     "CGI script is not executable (%r)" % scriptname)
                 return
 
-        # Reference: https://www6.uniovi.es/~antonio/ncsa_httpd/cgi/env.html
+        # Reference: http://hoohoo.ncsa.uiuc.edu/cgi/env.html
         # XXX Much of the following could be prepared ahead of time!
         env = copy.deepcopy(os.environ)
         env['SERVER_SOFTWARE'] = self.version_string()
@@ -1238,18 +1217,7 @@ class CGIHTTPRequestHandler(SimpleHTTPRequestHandler):
                                  env = env
                                  )
             if self.command.lower() == "post" and nbytes > 0:
-                cursize = 0
-                data = self.rfile.read(min(nbytes, _MIN_READ_BUF_SIZE))
-                while len(data) < nbytes and len(data) != cursize:
-                    cursize = len(data)
-                    # This is a geometric increase in read size (never more
-                    # than doubling out the current length of data per loop
-                    # iteration).
-                    delta = min(cursize, nbytes - cursize)
-                    try:
-                        data += self.rfile.read(delta)
-                    except TimeoutError:
-                        break
+                data = self.rfile.read(nbytes)
             else:
                 data = None
             # throw away additional data [see bug #427345]

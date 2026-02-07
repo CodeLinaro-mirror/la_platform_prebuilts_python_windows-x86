@@ -111,9 +111,6 @@ class CodecInfo(tuple):
                 (self.__class__.__module__, self.__class__.__qualname__,
                  self.name, id(self))
 
-    def __getnewargs__(self):
-        return tuple(self)
-
 class Codec:
 
     """ Defines the interface for stateless encoders/decoders.
@@ -417,9 +414,6 @@ class StreamWriter(Codec):
     def __exit__(self, type, value, tb):
         self.stream.close()
 
-    def __reduce_ex__(self, proto):
-        raise TypeError("can't serialize %s" % self.__class__.__name__)
-
 ###
 
 class StreamReader(Codec):
@@ -618,7 +612,7 @@ class StreamReader(Codec):
             method and are included in the list entries.
 
             sizehint, if given, is ignored since there is no efficient
-            way of finding the true end-of-line.
+            way to finding the true end-of-line.
 
         """
         data = self.read()
@@ -669,9 +663,6 @@ class StreamReader(Codec):
     def __exit__(self, type, value, tb):
         self.stream.close()
 
-    def __reduce_ex__(self, proto):
-        raise TypeError("can't serialize %s" % self.__class__.__name__)
-
 ###
 
 class StreamReaderWriter:
@@ -709,13 +700,13 @@ class StreamReaderWriter:
 
         return self.reader.read(size)
 
-    def readline(self, size=None, keepends=True):
+    def readline(self, size=None):
 
-        return self.reader.readline(size, keepends)
+        return self.reader.readline(size)
 
-    def readlines(self, sizehint=None, keepends=True):
+    def readlines(self, sizehint=None):
 
-        return self.reader.readlines(sizehint, keepends)
+        return self.reader.readlines(sizehint)
 
     def __next__(self):
 
@@ -758,9 +749,6 @@ class StreamReaderWriter:
 
     def __exit__(self, type, value, tb):
         self.stream.close()
-
-    def __reduce_ex__(self, proto):
-        raise TypeError("can't serialize %s" % self.__class__.__name__)
 
 ###
 
@@ -877,9 +865,6 @@ class StreamRecoder:
 
     def __exit__(self, type, value, tb):
         self.stream.close()
-
-    def __reduce_ex__(self, proto):
-        raise TypeError("can't serialize %s" % self.__class__.__name__)
 
 ### Shortcuts
 
@@ -1130,3 +1115,13 @@ except LookupError:
 _false = 0
 if _false:
     import encodings
+
+### Tests
+
+if __name__ == '__main__':
+
+    # Make stdout translate Latin-1 output into UTF-8 output
+    sys.stdout = EncodedFile(sys.stdout, 'latin-1', 'utf-8')
+
+    # Have stdin translate Latin-1 input into UTF-8 input
+    sys.stdin = EncodedFile(sys.stdin, 'utf-8', 'latin-1')

@@ -1,4 +1,3 @@
-import atexit
 import errno
 import os
 import selectors
@@ -62,7 +61,7 @@ class ForkServer(object):
 
     def set_forkserver_preload(self, modules_names):
         '''Set list of module names to try to load in forkserver process.'''
-        if not all(type(mod) is str for mod in modules_names):
+        if not all(type(mod) is str for mod in self._preload_modules):
             raise TypeError('module_names must be a list of strings')
         self._preload_modules = modules_names
 
@@ -127,13 +126,12 @@ class ForkServer(object):
             cmd = ('from multiprocessing.forkserver import main; ' +
                    'main(%d, %d, %r, **%r)')
 
-            main_kws = {}
             if self._preload_modules:
+                desired_keys = {'main_path', 'sys_path'}
                 data = spawn.get_preparation_data('ignore')
-                if 'sys_path' in data:
-                    main_kws['sys_path'] = data['sys_path']
-                if 'init_main_from_path' in data:
-                    main_kws['main_path'] = data['init_main_from_path']
+                data = {x: y for x, y in data.items() if x in desired_keys}
+            else:
+                data = {}
 
             with socket.socket(socket.AF_UNIX) as listener:
                 address = connection.arbitrary_address('AF_UNIX')
@@ -148,7 +146,7 @@ class ForkServer(object):
                 try:
                     fds_to_pass = [listener.fileno(), alive_r]
                     cmd %= (listener.fileno(), alive_r, self._preload_modules,
-                            main_kws)
+                            data)
                     exe = spawn.get_executable()
                     args = [exe] + util._args_from_interpreter_flags()
                     args += ['-c', cmd]
@@ -169,8 +167,6 @@ class ForkServer(object):
 def main(listener_fd, alive_r, preload, main_path=None, sys_path=None):
     '''Run forkserver.'''
     if preload:
-        if sys_path is not None:
-            sys.path[:] = sys_path
         if '__main__' in preload and main_path is not None:
             process.current_process()._inheriting = True
             try:
@@ -182,10 +178,6 @@ def main(listener_fd, alive_r, preload, main_path=None, sys_path=None):
                 __import__(modname)
             except ImportError:
                 pass
-
-        # gh-135335: flush stdout/stderr in case any of the preloaded modules
-        # wrote to them, otherwise children might inherit buffered data
-        util._flush_std_streams()
 
     util._close_stdin()
 
@@ -279,8 +271,6 @@ def main(listener_fd, alive_r, preload, main_path=None, sys_path=None):
                                 selector.close()
                                 unused_fds = [alive_r, child_w, sig_r, sig_w]
                                 unused_fds.extend(pid_to_fd.values())
-                                atexit._clear()
-                                atexit.register(util._exit_function)
                                 code = _serve_one(child_r, fds,
                                                   unused_fds,
                                                   old_handlers)
@@ -288,7 +278,6 @@ def main(listener_fd, alive_r, preload, main_path=None, sys_path=None):
                                 sys.excepthook(*sys.exc_info())
                                 sys.stderr.flush()
                             finally:
-                                atexit._run_exitfuncs()
                                 os._exit(code)
                         else:
                             # Send pid to client process

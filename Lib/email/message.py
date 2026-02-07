@@ -14,7 +14,7 @@ from io import BytesIO, StringIO
 # Intrapackage imports
 from email import utils
 from email import errors
-from email._policybase import compat32
+from email._policybase import Policy, compat32
 from email import charset as _charset
 from email._encoded_words import decode_b
 Charset = _charset.Charset
@@ -74,25 +74,19 @@ def _parseparam(s):
     # RDM This might be a Header, so for now stringify it.
     s = ';' + str(s)
     plist = []
-    start = 0
-    while s.find(';', start) == start:
-        start += 1
-        end = s.find(';', start)
-        ind, diff = start, 0
-        while end > 0:
-            diff += s.count('"', ind, end) - s.count('\\"', ind, end)
-            if diff % 2 == 0:
-                break
-            end, ind = ind, s.find(';', end + 1)
+    while s[:1] == ';':
+        s = s[1:]
+        end = s.find(';')
+        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
+            end = s.find(';', end + 1)
         if end < 0:
             end = len(s)
-        i = s.find('=', start, end)
-        if i == -1:
-            f = s[start:end]
-        else:
-            f = s[start:i].rstrip().lower() + '=' + s[i+1:end].lstrip()
+        f = s[:end]
+        if '=' in f:
+            i = f.index('=')
+            f = f[:i].strip().lower() + '=' + f[i+1:].strip()
         plist.append(f.strip())
-        start = end
+        s = s[end:]
     return plist
 
 
@@ -141,7 +135,7 @@ def _decode_uu(encoded):
 class Message:
     """Basic message object.
 
-    A message object is defined as something that has a bunch of RFC 5322
+    A message object is defined as something that has a bunch of RFC 2822
     headers and a payload.  It may optionally have an envelope header
     (a.k.a. Unix-From or From_ header).  If the message is a container (i.e. a
     multipart or a message/rfc822), then the payload is a list of Message
@@ -292,35 +286,28 @@ class Message:
         if i is not None and not isinstance(self._payload, list):
             raise TypeError('Expected list, got %s' % type(self._payload))
         payload = self._payload
-        cte = self.get('content-transfer-encoding', '')
-        if hasattr(cte, 'cte'):
-            cte = cte.cte
-        else:
-            # cte might be a Header, so for now stringify it.
-            cte = str(cte).strip().lower()
+        # cte might be a Header, so for now stringify it.
+        cte = str(self.get('content-transfer-encoding', '')).lower()
         # payload may be bytes here.
-        if not decode:
-            if isinstance(payload, str) and utils._has_surrogates(payload):
-                try:
-                    bpayload = payload.encode('ascii', 'surrogateescape')
+        if isinstance(payload, str):
+            if utils._has_surrogates(payload):
+                bpayload = payload.encode('ascii', 'surrogateescape')
+                if not decode:
                     try:
-                        payload = bpayload.decode(self.get_content_charset('ascii'), 'replace')
+                        payload = bpayload.decode(self.get_param('charset', 'ascii'), 'replace')
                     except LookupError:
                         payload = bpayload.decode('ascii', 'replace')
-                except UnicodeEncodeError:
-                    pass
+            elif decode:
+                try:
+                    bpayload = payload.encode('ascii')
+                except UnicodeError:
+                    # This won't happen for RFC compliant messages (messages
+                    # containing only ASCII code points in the unicode input).
+                    # If it does happen, turn the string into bytes in a way
+                    # guaranteed not to fail.
+                    bpayload = payload.encode('raw-unicode-escape')
+        if not decode:
             return payload
-        if isinstance(payload, str):
-            try:
-                bpayload = payload.encode('ascii', 'surrogateescape')
-            except UnicodeEncodeError:
-                # This won't happen for RFC compliant messages (messages
-                # containing only ASCII code points in the unicode input).
-                # If it does happen, turn the string into bytes in a way
-                # guaranteed not to fail.
-                bpayload = payload.encode('raw-unicode-escape')
-        else:
-            bpayload = payload
         if cte == 'quoted-printable':
             return quopri.decodestring(bpayload)
         elif cte == 'base64':
@@ -352,7 +339,7 @@ class Message:
                 return
             if not isinstance(charset, Charset):
                 charset = Charset(charset)
-            payload = payload.encode(charset.output_charset, 'surrogateescape')
+            payload = payload.encode(charset.output_charset)
         if hasattr(payload, 'decode'):
             self._payload = payload.decode('ascii', 'surrogateescape')
         else:
@@ -461,11 +448,7 @@ class Message:
         self._headers = newheaders
 
     def __contains__(self, name):
-        name_lower = name.lower()
-        for k, v in self._headers:
-            if name_lower == k.lower():
-                return True
-        return False
+        return name.lower() in [k.lower() for k, v in self._headers]
 
     def __iter__(self):
         for field, value in self._headers:
@@ -572,7 +555,7 @@ class Message:
 
         msg.add_header('content-disposition', 'attachment', filename='bud.gif')
         msg.add_header('content-disposition', 'attachment',
-                       filename=('utf-8', '', 'Fußballer.ppt'))
+                       filename=('utf-8', '', Fußballer.ppt'))
         msg.add_header('content-disposition', 'attachment',
                        filename='Fußballer.ppt'))
         """
