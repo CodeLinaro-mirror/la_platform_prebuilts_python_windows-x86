@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<manifest>
+  <remote name="aosp" fetch="https://android.googlesource.com/" review="https://android.googlesource.com/" />
+  <remote name="aospsuperproject" fetch="https://android.googlesource.com/" review="https://android.googlesource.com/" revision="ndk-kokoro-main" />
+  <default revision="master" remote="aosp" sync-j="4" />
+  <superproject name="platform/superproject" remote="aospsuperproject" />
+  <project path="external/bzip2" name="platform/external/bzip2" revision="8aa64d0cf768bd6c785ec00b7a8bd0aa58ee385b" />
+  <project path="external/libffi" name="platform/external/libffi" revision="8e872f4bcb876822fba686d7f483b91456e6ab1a" />
+  <project path="external/mpdecimal" name="platform/external/mpdecimal" revision="ed7ca08a5e74aab5f0c5a15cbc08f2364dbe69a3" />
+  <project path="external/python/cpython3" name="platform/external/python/cpython3" revision="20c3738752477da39dce309eb3083c2091f7b880" />
+  <project path="external/zlib" name="platform/external/zlib" revision="005a9ebbf058baa0ac9fad74e643116317e64cda" />
+  <project path="prebuilts/cmake/windows-x86" name="platform/prebuilts/cmake/windows-x86" revision="f6283abb0a655968016437be07d04370fd815e6c" />
+  <project path="prebuilts/python/windows-x86" name="platform/prebuilts/python/windows-x86" revision="06e01277ae8369c2442be4b9793ab04a278b589c" />
+  <project path="toolchain/ndk-kokoro" name="toolchain/ndk-kokoro" revision="f71eb25ea79c56f54b3cdc0f319ac2e7f0efaf1b" />
+  <project path="toolchain/xz" name="toolchain/xz" revision="344ec8838064682d8803fa483bee7e4455cbddac" />
+</manifest>
